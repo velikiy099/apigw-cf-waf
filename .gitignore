@@ -1,0 +1,17 @@
+# Terraform / Terragrunt
+.terraform/
+.terragrunt-cache/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+*.tfvars
+*.tfvars.json
+.terraform.lock.hcl
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
