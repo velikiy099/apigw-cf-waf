@@ -1,109 +1,124 @@
 # apigw-cf-waf
 
-Terraform/Terragrunt example for serving a private frontend from CloudFront + S3 and protecting an API Gateway REST API with CloudFront, AWS WAF, Cognito User Pool authentication, and an origin verification header.
+CloudFront + S3 でフロントエンドを配信し、`/api/*` を API Gateway に転送する構成を Terragrunt/Terraform で作るサンプルです。
 
-## Architecture
+認証は Cognito User Pool + Hosted UI を使います。API Gateway は Cognito User Pool Authorizer で JWT を検証します。
+
+## 構成
 
 ```text
 Browser
   -> CloudFront
-       WAF: allow only corporate CIDRs
+       WAF: 社内 CIDR のみ allow
        /*      -> S3 frontend origin
        /api/*  -> API Gateway origin
-                  adds x-origin-verify to origin request
-                  forwards Authorization header
+                  Authorization header を転送
+                  x-origin-verify を origin request に付与
   -> API Gateway REST API
-       Resource policy: allow CloudFront origin-facing IP ranges only
-       WAF: require x-origin-verify header
+       WAF: CloudFront published IP range かつ x-origin-verify 一致のみ allow
        Cognito User Pool Authorizer
-  -> mock integration / replace with Lambda or HTTP backend
+  -> mock integration
 ```
 
-The important point is that these controls have different roles:
+このリポジトリでは、API Gateway の `execute-api` エンドポイントがインターネット到達可能であることを前提に、API Gateway 側にも WAF を付けています。
 
-- CloudFront WAF corporate CIDR allow-list limits the public entry point.
-- API Gateway resource policy limits direct `execute-api` access to CloudFront origin-facing IP ranges.
-- `x-origin-verify` identifies requests that came through this CloudFront distribution, not merely some CloudFront distribution.
-- Cognito Authorizer authenticates the user. The origin verification header is not a replacement for user authentication.
+- CloudFront WAF は、正規入口を社内 CIDR に限定します。
+- API Gateway WAF は、`execute-api` 直叩きを CloudFront published IP range 以外から拒否します。
+- `x-origin-verify` は、自分の CloudFront distribution から来たことを補助的に確認します。
+- Cognito Authorizer は、API 利用者を認証します。`x-origin-verify` はユーザー認証の代替ではありません。
+
+詳細は [docs/security-design.md](docs/security-design.md) を参照してください。
 
 ## Repository layout
 
 ```text
 .
+├── README.md
 ├── terragrunt.hcl
 ├── envs/
 │   └── dev/
 │       └── terragrunt.hcl
+├── docs/
+│   └── security-design.md
 └── modules/
-    ├── api-gateway/
-    ├── cloudfront/
-    └── cognito/
+    └── stack/
+        ├── api-gateway.tf
+        ├── cloudfront.tf
+        ├── cognito.tf
+        ├── data.tf
+        ├── locals.tf
+        ├── outputs.tf
+        ├── s3.tf
+        ├── variables.tf
+        └── waf.tf
 ```
+
+See also: `docs/security-design.md` for the threat model and security rationale.
 
 ## Prerequisites
 
 - Terraform >= 1.6
 - Terragrunt >= 0.55
-- AWS credentials with permissions for S3, CloudFront, API Gateway, WAFv2, Cognito, IAM, and ACM if you later add custom domains.
+- AWS credentials with permissions for S3, CloudFront, API Gateway, WAFv2, Cognito, IAM, and DynamoDB/S3 for remote state.
 
 ## Deploy
 
+`envs/dev/terragrunt.hcl` の `corporate_ipv4_cidrs` を実際の社内出口 CIDR に変更してください。デフォルト値 `203.0.113.0/24` は TEST-NET-3 のプレースホルダーなので、そのままだと実利用できません。
+
+`origin_verify_secret` は Git にコミットしないでください。以下のように環境変数で渡します。
+
 ```bash
+export ORIGIN_VERIFY_SECRET=$(openssl rand -base64 32)
 cd envs/dev
 terragrunt init
 terragrunt plan
 terragrunt apply
 ```
 
-The example deploys without a custom domain. CloudFront's generated domain name is used as the application URL.
+apply 後、CloudFront のドメイン、Cognito Hosted UI ドメイン、SPA app client ID などが output されます。
 
-## Required inputs
+## API call from frontend
 
-Edit `envs/dev/terragrunt.hcl` before applying:
-
-- `region`
-- `corporate_ipv4_cidrs`
-- `corporate_ipv6_cidrs` if needed
-- `origin_verify_secret`
-
-Generate the origin verification secret with something like:
-
-```bash
-openssl rand -base64 32
-```
-
-Do not commit real secrets. In production, pass it from your CI secret store or a Terragrunt include generated from a private location.
-
-## Notes
-
-### API Gateway direct access
-
-Without API Gateway-side restrictions, the default `execute-api` endpoint remains reachable from the internet even when CloudFront is protected by a corporate CIDR allow-list. This repo therefore applies an API Gateway resource policy that allows only CloudFront origin-facing IP ranges.
-
-That restriction does not prove the request came from your CloudFront distribution. A different CloudFront distribution could still be used as a source. For that reason, the API Gateway WAF also checks `x-origin-verify`.
-
-### Fixed origin secret
-
-`x-origin-verify` is a shared secret. It is effective only while secret. Use a high-entropy value, keep it out of logs and Git, and rotate it periodically. For rotation, temporarily allow both old and new values in WAF, update CloudFront, verify propagation, then remove the old value.
-
-### Cognito Hosted UI
-
-The Cognito module creates a User Pool, App Client, and Hosted UI domain. The app client uses Authorization Code Grant and has no client secret so it can be used by a browser SPA. Callback and logout URLs point at the CloudFront domain after it is known; for a production custom domain, set those URLs to your application domain instead.
-
-## After deployment
-
-Upload frontend files to the S3 bucket output by Terragrunt/Terraform, then access the CloudFront domain. The frontend should obtain an access token from Cognito Hosted UI and call the API with:
+フロントエンドは Cognito Hosted UI の Authorization Code + PKCE でログインし、取得した access token を `Authorization` ヘッダーに入れて CloudFront の `/api/*` を呼びます。
 
 ```http
+GET /api/example HTTP/1.1
+Host: <cloudfront-domain>
 Authorization: Bearer <access_token>
 ```
 
-## Production hardening checklist
+CloudFront は API Gateway origin に転送する際に `x-origin-verify` を付与します。ブラウザ側でこのヘッダーを知る必要はありません。
 
-- Replace the mock API integration with Lambda, HTTP, or private integration.
-- Put `origin_verify_secret` in a secret store, not in committed Terragrunt files.
-- Enable CloudFront, WAF, and API Gateway access logs.
-- Add AWS managed WAF rule groups after verifying false positives.
-- Add rate-based WAF rules.
-- Consider disabling the execute-api endpoint if you later move to a custom domain pattern that supports it cleanly.
-- Use a real custom domain and ACM certificate for production CloudFront.
+## Direct API Gateway access test
+
+通常のインターネット送信元から API Gateway invoke URL を直接叩くと、API Gateway WAF で block される想定です。
+
+```bash
+curl -i "$(terragrunt output -raw api_gateway_invoke_url)/api/example"
+```
+
+CloudFront 経由では、CloudFront WAF の社内 CIDR チェック、API Gateway WAF の CloudFront IP + `x-origin-verify` チェック、Cognito Authorizer の順で制限されます。
+
+## Notes
+
+### API Gateway backend
+
+このサンプルの API Gateway は mock integration です。本番では `aws_api_gateway_integration` を Lambda proxy integration、HTTP proxy integration、private integration などに置き換えてください。
+
+### CloudFront IP ranges
+
+API Gateway WAF の CloudFront IP allow-list は、Terraform plan 時に `https://ip-ranges.amazonaws.com/ip-ranges.json` を読み、`service == "CLOUDFRONT"` の CIDR を WAF IP set に入れます。固定したい場合は `cloudfront_origin_facing_ipv4_cidrs_override` / `cloudfront_origin_facing_ipv6_cidrs_override` を設定してください。
+
+### IPv6
+
+`corporate_ipv6_cidrs` が空の場合、CloudFront IPv6 は無効化されます。IPv6 を有効にする場合は、社内 IPv6 出口 CIDR も WAF allow-list に入れてください。
+
+### Production hardening checklist
+
+- `origin_verify_secret` を CI secret store などから渡す。
+- Terraform/Terragrunt state backend へのアクセスを厳格に制限する。
+- CloudFront、AWS WAF、API Gateway の access log を有効化する。
+- AWS Managed Rules の false positive を検証する。
+- mock integration を実バックエンドに置き換える。
+- 本番では ACM 証明書 + 独自ドメインを CloudFront に設定する。
+- Hosted UI callback/logout URL を本番ドメインに更新する。
